@@ -27,7 +27,14 @@ local defaults = {
   },
   shake = { enabled = true, from_level = 5, rows = 2 },
   flash = { enabled = true, pulses = 2 },
-  counter = { enabled = true }, -- the ⚡ combo counter at the end of the cursor's line
+  counter = {
+    enabled = true,
+    statusline = true, -- the ⚡ segment; add %{v:lua.require'power-surge'.statusline()} to lualine
+    tern = true, -- publish the combo to Tern's chrome (tern/power-surge.window.luau reads it)
+    -- A rendezvous both processes can open without agreeing on $HOME: one small JSON per cwd.
+    tern_dir = "/tmp/power-surge",
+    tern_interval_ms = 120, -- how often the state file is rewritten while typing
+  },
   overdrive = {
     word = "surge", -- typed in insert mode, this word fires the easter egg
     burst = 120,
@@ -76,7 +83,8 @@ local state = {
   ns = nil,
   timer = nil,
   decay = nil,
-  counter = nil, -- { buf, id } of the combo counter, while one is shown
+  published = nil, -- when the Tern state file was last written
+  tern_dir_made = false,
   particles = {},
   combo = 0,
   level = 0,
@@ -127,40 +135,46 @@ local function drop(p)
   end
 end
 
---- The combo counter: one extmark at the end of the cursor's line, rewritten in place.
-local function show_counter(win, buf, combo, level)
-  if not state.cfg.counter.enabled
-    or not vim.api.nvim_buf_is_valid(buf)
-    or vim.api.nvim_win_get_config(win).relative ~= ""
-  then
-    return
+--- The statusline segment, for lualine or for 'statusline':
+--- `%{v:lua.require'power-surge'.statusline()}`.
+function M.statusline()
+  if not state.cfg.counter.enabled or state.level <= 0 then
+    return ""
   end
-  local name = tier(level).name
-  local text = ("⚡ %d"):format(combo)
-  if name ~= "" then
-    text = text .. "  " .. name
-  end
-  local row = unpack(vim.api.nvim_win_get_cursor(win))
-  local opts = {
-    virt_text = { { text, HL[math.min(#HL, level)] } },
-    virt_text_pos = "eol",
-    hl_mode = "combine",
-  }
-  if state.counter and state.counter.buf == buf then
-    opts.id = state.counter.id
-  end
-  local ok, id = pcall(vim.api.nvim_buf_set_extmark, buf, state.ns, row - 1, 0, opts)
-  if ok then
-    state.counter = { buf = buf, id = id }
-  end
+  local name = tier(state.level).name
+  return ("⚡%d%s"):format(state.combo, name ~= "" and (" " .. name) or "")
 end
 
-local function hide_counter()
-  local c = state.counter
-  state.counter = nil
-  if c and vim.api.nvim_buf_is_valid(c.buf) then
-    pcall(vim.api.nvim_buf_del_extmark, c.buf, state.ns, c.id)
+--- Publish the combo to Tern, which draws it in the tab's title. Tern's window half polls
+--- this file, so the write is throttled: one small file, a few times a second while typing.
+local function publish(force)
+  local cfg = state.cfg.counter
+  if not cfg.tern then
+    return
   end
+  local t = now()
+  if not force and t - (state.published or 0) < cfg.tern_interval_ms then
+    return
+  end
+  state.published = t
+  local dir = cfg.tern_dir
+  if not state.tern_dir_made then
+    state.tern_dir_made = true
+    pcall(vim.fn.mkdir, dir, "p")
+  end
+  -- One file per working directory: the Tern formatter matches a tab by its cwd.
+  local slug = vim.fn.sha256(vim.fn.getcwd()):sub(1, 16)
+  local path = dir .. "/" .. slug .. ".json"
+  local payload = vim.json.encode({
+    cwd = vim.fn.getcwd(),
+    home = vim.env.HOME, -- Tern shows the home directory as `~`; it needs the prefix to match
+    home = vim.env.HOME, -- Tern shows the home directory as `~`; it needs the prefix to match
+    combo = state.combo,
+    level = state.level,
+    name = tier(state.level).name,
+    at = t,
+  })
+  pcall(vim.fn.writefile, { payload }, path)
 end
 
 local function clear_particles()
@@ -257,7 +271,7 @@ local function step()
   if now() - state.last_ms > cfg.combo.decay_ms and state.level > 0 then
     state.combo = 0
     state.level = 0
-    hide_counter()
+    publish(true)
   end
   -- The counter outlives the last particle: keep ticking until the combo decays.
   if #state.particles == 0 and state.level == 0 then
@@ -390,7 +404,7 @@ local function on_change()
   local row, col = unpack(vim.api.nvim_win_get_cursor(win))
   local count = math.random(cfg.burst[1], cfg.burst[2]) + (level - 1) * cfg.per_level
   spawn(buf, row - 1, col, count, level)
-  show_counter(win, buf, state.combo, level)
+  publish(false)
   start()
 
   if level > previous then
@@ -428,7 +442,7 @@ function M.set_enabled(value)
     state.combo = 0
     state.level = 0
     clear_particles()
-    hide_counter()
+    publish(true)
     stop()
   end
   vim.notify("power-surge " .. (state.cfg.enabled and "on" or "off"), vim.log.levels.INFO, { title = "power-surge" })
@@ -453,7 +467,7 @@ end
 
 function M.clear()
   clear_particles()
-  hide_counter()
+  publish(true)
   state.combo = 0
   state.level = 0
   stop()
