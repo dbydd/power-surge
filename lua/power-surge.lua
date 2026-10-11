@@ -16,9 +16,13 @@ local defaults = {
   },
   counter = {
     enabled = true,
-    -- Where the float sits in the window: "bottom-right" (out of the way) or "cursor".
-    at = "bottom-right",
-    render = nil, -- function(combo, level, name) -> string; replaces the default label
+    -- The float, in the spirit of power-mode's combo box: rounded border, a bar that drains
+    -- as the combo nears its decay, four corners to pick from.
+    position = "bottom-right", -- top-right | top-left | bottom-right | bottom-left
+    width = 20,
+    height = 3,
+    linger_s = 2, -- the box stays this long after the combo dies, then hides
+    render = nil, -- function(combo, level, name, bar) -> { string }; replaces the default box
     tern = true, -- publish the combo for the Tern half (tern/window.luau reads it)
     -- A rendezvous both processes can open without agreeing on $HOME: one small JSON per cwd.
     tern_dir = "/tmp/power-surge",
@@ -61,8 +65,13 @@ local state = {
   level = 0,
   last_ms = 0,
   typed = "",
+  hidden = true, -- the float's visibility; the window and buffer stay for the next combo
+  hide_timer = nil,
   buf = nil,
   win = nil,
+  base_row = 1,
+  base_col = 0,
+  last_render = nil, -- the drawn text, so an unchanged frame costs no buffer write
   wired = false,
 }
 
@@ -100,58 +109,108 @@ local function label()
   return ("⚡%d%s"):format(state.combo, t.name ~= "" and (" " .. t.name) or "")
 end
 
---- Close the counter float; the buffer is kept for the next combo.
+--- Close the counter float but keep the buffer, so the next keystroke reopens it instantly.
 local function close_counter()
+  if state.hide_timer then
+    state.hide_timer:stop()
+    state.hide_timer = nil
+  end
+  state.hidden = true
+  state.last_render = nil
   if state.win and vim.api.nvim_win_is_valid(state.win) then
     pcall(vim.api.nvim_win_close, state.win, true)
   end
   state.win = nil
 end
 
---- Draw the counter in a corner float. Never focusable, never entering the buffer, never
---- touching the cursor or the viewport: it is chrome, and it leaves on its own.
+--- Where the float sits, power-mode style: a corner of the editor, clear of the statusline.
+local function compute_position(cfg)
+  local w, h = cfg.width, cfg.height
+  local row, col
+  if cfg.position == "top-right" then
+    row, col = 1, vim.o.columns - w - 2
+  elseif cfg.position == "top-left" then
+    row, col = 1, 2
+  elseif cfg.position == "bottom-left" then
+    row, col = vim.o.lines - h - 3, 2
+  else
+    row, col = vim.o.lines - h - 3, vim.o.columns - w - 2
+  end
+  return math.max(0, row), math.max(0, col)
+end
+
+--- Draw the counter float, power-mode's combo box: a rounded box that opens on the first
+--- keystroke, shows the streak and the decay bar, and lingers a moment after the combo dies.
+--- Never focusable, never entering the buffer, never touching the cursor or the viewport.
 local function show_counter()
   local cfg = state.cfg.counter
-  if not cfg.enabled or state.level <= 0 then
+  if not cfg.enabled then
     close_counter()
     return
   end
-  local text = cfg.render and cfg.render(state.combo, state.level, tier(state.level).name) or label()
-  local width = math.max(1, vim.fn.strdisplaywidth(text)) + 2
+  if state.hide_timer then
+    state.hide_timer:stop()
+    state.hide_timer = nil
+  end
+  state.hidden = false
+
   if not state.buf or not vim.api.nvim_buf_is_valid(state.buf) then
     state.buf = vim.api.nvim_create_buf(false, true)
   end
-  vim.bo[state.buf].modifiable = true
-  vim.api.nvim_buf_set_lines(state.buf, 0, -1, false, { " " .. text .. " " })
-  vim.bo[state.buf].modifiable = false
-  vim.api.nvim_set_hl(0, HL, { link = "DiagnosticWarn", default = true })
-  local col, row
-  if cfg.at == "cursor" then
-    local pos = vim.fn.winline() - 1
-    local cursor_col = vim.fn.wincol() - 1
-    row = pos + 2
-    col = cursor_col
-  else
-    row = vim.o.lines - vim.o.cmdheight - 3
-    col = vim.o.columns - width - 2
+
+  if not state.win or not vim.api.nvim_win_is_valid(state.win) then
+    state.base_row, state.base_col = compute_position(cfg)
+    local ok, win = pcall(vim.api.nvim_open_win, state.buf, false, {
+      relative = "editor",
+      row = state.base_row,
+      col = state.base_col,
+      width = cfg.width,
+      height = cfg.height,
+      style = "minimal",
+      border = "rounded",
+      focusable = false,
+      noautocmd = true,
+      zindex = 100,
+    })
+    if not ok then
+      return
+    end
+    state.win = win
+    state.last_render = nil
+    vim.wo[state.win].winhighlight = "Normal:PowerSurgeCounter,NormalFloat:PowerSurgeCounter,FloatBorder:PowerSurgeCounter"
   end
+
+  -- The decay bar: how much of the combo window is left before the meter falls to zero.
+  local cfg_combo = state.cfg.combo
+  local left = math.max(0, cfg_combo.decay_ms - (now() - state.last_ms))
+  local bar_width = math.max(1, cfg.width - 4)
+  local filled = math.floor(math.min(1, left / cfg_combo.decay_ms) * bar_width)
+  local bar = string.rep("█", filled) .. string.rep("░", bar_width - filled)
+  local name = tier(state.level).name
+  local lines = cfg.render
+      and cfg.render(state.combo, state.level, name, bar)
+    or { ("⚡ %d %s"):format(state.combo, name), "  " .. bar }
+
   local opts = {
     relative = "editor",
-    row = math.max(0, row),
-    col = math.max(0, col),
-    width = width,
-    height = 1,
-    style = "minimal",
-    focusable = false,
-    noautocmd = true,
-    zindex = 60,
+    row = state.base_row,
+    col = state.base_col,
+    width = cfg.width,
+    height = cfg.height,
   }
-  if state.win and vim.api.nvim_win_is_valid(state.win) then
-    pcall(vim.api.nvim_win_set_config, state.win, opts)
-  else
-    state.win = vim.api.nvim_open_win(state.buf, false, opts)
+  pcall(vim.api.nvim_win_set_config, state.win, opts)
+
+  local text = table.concat(lines, "\n")
+  if text ~= state.last_render then
+    state.last_render = text
+    vim.bo[state.buf].modifiable = true
+    local padded = {}
+    for i = 1, cfg.height do
+      padded[i] = lines[i] or ""
+    end
+    vim.api.nvim_buf_set_lines(state.buf, 0, -1, false, padded)
+    vim.bo[state.buf].modifiable = false
   end
-  vim.wo[state.win].winhighlight = "Normal:PowerSurgeCounter,NormalFloat:PowerSurgeCounter"
 end
 
 --- Publish the combo to Tern, which plays its own cursor effects for it. The write is
@@ -210,8 +269,18 @@ local function arm_decay()
       if now() - state.last_ms >= cfg.decay_ms then
         state.combo = 0
         state.level = 0
-        close_counter()
         publish(true)
+        -- The box lingers a moment, power-mode's disappear delay, then hides itself. A new
+        -- keystroke cancels this from `show_counter`.
+        local linger = (state.cfg.counter.linger_s or 0) * 1000
+        if linger <= 0 then
+          close_counter()
+        elseif not state.hide_timer then
+          state.hide_timer = uv.new_timer()
+          state.hide_timer:start(linger, 0, function()
+            vim.schedule(close_counter)
+          end)
+        end
       end
     end)
   end)
