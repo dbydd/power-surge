@@ -26,9 +26,10 @@ drives them: each action types a `:lua` command into the focused Neovim pane.
 
 | Where | Effect |
 |---|---|
-| Text change | 2 to 4 particles, more as the level climbs |
+| Text change | 3 to 6 particles, plus 3 per combo level |
 | Combo | 5 changes per level, up to level 6, reset after 1.2 s of quiet |
-| Level 3+ | sharper glyphs (`✳ ✷ ↯ ⚡`), wider fountain |
+| Counter | `⚡ 12 SURGE` at the end of the cursor's line, rewritten in place |
+| Level 3+ | sharper glyphs (`✦ ✷ ↯ ⚡ ★`), a wider fountain |
 | Level 5, 6 | a toast, and the viewport shakes |
 | `surge` typed in insert mode | a 120-particle burst, a background flash, a shake |
 | `<leader>up` | toggle |
@@ -72,8 +73,9 @@ Every default lives in `defaults` at the top of `lua/power-surge.lua`:
 ```lua
 opts = {
   fps = 45,
-  max_particles = 160,
-  burst = { 2, 4 },
+  max_particles = 240,
+  burst = { 3, 6 },
+  spread = 1.2,
   combo = { window_ms = 600, step = 5, max_level = 6, decay_ms = 1200 },
   shake = { enabled = true, from_level = 5, rows = 2 },
   flash = { enabled = true, pulses = 2 },
