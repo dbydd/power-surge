@@ -184,18 +184,65 @@ local function wake()
 end
 
 --- Commands: the easter egg and the toggle, aimed at the focused Neovim pane.
+---
+--- `pane.program` reports the shell that runs neotern, never neotern itself, so the pane is
+--- recognized by its side of the bargain instead: a fresh state file for that pane's cwd
+--- means the Neovim half is live there.
+local FRESH_MS = 15000
+
+local function has_state(cwd)
+  if cwd == nil or cwd == "" then
+    return false
+  end
+  if not tern.fs.exists(STATE_DIR) then
+    return false
+  end
+  for _, name in ipairs(tern.fs.list(STATE_DIR)) do
+    if string.sub(name, -5) == ".json" then
+      local ok, body = pcall(tern.fs.read, STATE_DIR .. "/" .. name, 4096)
+      if ok and body then
+        local decoded = tern.json.decode(body)
+        if decoded and matches(decoded, cwd) then
+          return decoded
+        end
+      end
+    end
+  end
+  return nil
+end
+
+--- True only while the pane's Neovim half is alive: the file must be recent, and two polls
+--- apart the combo changes, so an old file from a closed editor does not qualify.
+local function nvim_pane(cwd, title)
+  if title and (string.match(title, "ntern") or string.match(title, "neotern") or string.match(title, "nvim")) then
+    return cwd
+  end
+  local decoded = has_state(cwd)
+  if decoded == nil then
+    return nil
+  end
+  local seen = (state_seen[cwd] or 0)
+  if decoded.combo ~= seen then
+    state_seen[cwd] = decoded.combo
+    fresh_seen[cwd] = tern.now()
+    return cwd
+  end
+  if (tern.now() - (fresh_seen[cwd] or 0)) < FRESH_MS then
+    return cwd
+  end
+  return nil
+end
+
+local state_seen, fresh_seen = {}, {}
+
 local function focused_nvim(cx)
   local focused = cx.session:focused()
   if focused == nil then
     return nil
   end
   for _, pane in ipairs(cx.session:panes()) do
-    if pane.pane == focused then
-      local program = pane.program or ""
-      if string.match(program, "neotern") or string.match(program, "nvim") then
-        return pane.pane
-      end
-      return nil
+    if pane.pane == focused and nvim_pane(pane.cwd, pane.title) then
+      return pane.pane
     end
   end
   return nil
