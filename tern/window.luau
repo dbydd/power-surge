@@ -35,6 +35,14 @@ end
 
 --- A state file matches a tab when their directories agree, either as absolute paths or
 --- after the `~` shortening Tern uses in some places.
+--- macOS resolves /tmp through /private/tmp, and a pane's cwd may carry either spelling.
+local function without_private(path)
+  if path:sub(1, 9) == "/private/" then
+    return path:sub(9)
+  end
+  return path
+end
+
 local function matches(file, tab_cwd)
   if file == nil or tab_cwd == nil or tab_cwd == "" then
     return false
@@ -48,7 +56,11 @@ local function matches(file, tab_cwd)
   if raw == cwd then
     return true
   end
-  return display(raw, file.home) == cwd
+  if without_private(raw) == without_private(cwd) then
+    return true
+  end
+  local shown = display(raw, file.home)
+  return shown == cwd or without_private(shown) == without_private(cwd)
 end
 
 --- Read the state file for `cwd`; the file is the source of truth for the combo.
