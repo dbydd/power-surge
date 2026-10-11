@@ -11,13 +11,14 @@ local M = {}
 local defaults = {
   enabled = true,
   fps = 45, -- frames per second while particles are alive
-  max_particles = 160,
-  burst = { 2, 4 }, -- particles per change, before the level bonus
-  per_level = 2, -- extra particles per combo level
-  gravity = 0.30, -- rows per frame, added every frame
-  kick = 0.5, -- sideways speed, scaled by level
-  drag = 0.93, -- sideways decay per frame
-  life = { 18, 30 }, -- frames a particle lives
+  max_particles = 240,
+  burst = { 3, 6 }, -- particles per change, before the level bonus
+  per_level = 3, -- extra particles per combo level
+  gravity = 0.34, -- rows per frame, added every frame
+  kick = 0.7, -- sideways speed, scaled by level
+  drag = 0.94, -- sideways decay per frame
+  life = { 26, 44 }, -- frames a particle lives
+  spread = 1.2, -- columns of jitter at the spawn row, scaled by level
   combo = {
     window_ms = 600, -- a longer gap than this starts a new combo
     step = 5, -- changes per level
@@ -26,11 +27,11 @@ local defaults = {
   },
   shake = { enabled = true, from_level = 5, rows = 2 },
   flash = { enabled = true, pulses = 2 },
+  counter = { enabled = true }, -- the ⚡ combo counter at the end of the cursor's line
   overdrive = {
     word = "surge", -- typed in insert mode, this word fires the easter egg
     burst = 120,
   },
-  levels = { [4] = "SURGE", [5] = "OVERDRIVE", [6] = "UNSTOPPABLE" },
   exclude_buftypes = { "prompt", "nofile", "quickfix", "terminal", "help" },
   exclude_filetypes = {
     "TelescopePrompt",
@@ -45,33 +46,37 @@ local defaults = {
 }
 
 -- One row per combo level: sharper glyphs and a wider fountain as the combo climbs.
+--- One row per combo level: sharper glyphs and a wider fountain as the combo climbs.
 local TIERS = {
-  { glyphs = { "·" } },
-  { glyphs = { "·", "˙" } },
-  { glyphs = { "∙", "·", "˙" } },
-  { glyphs = { "✳", "∙", "+" } },
-  { glyphs = { "✷", "✳", "+", "↯" } },
-  { glyphs = { "↯", "✷", "⚡" } },
+  { name = "", glyphs = { "•", "∙" } },
+  { name = "", glyphs = { "✦", "•" } },
+  { name = "SPARK", glyphs = { "✦", "✧", "•" } },
+  { name = "SURGE", glyphs = { "✷", "✦", "✧" } },
+  { name = "OVERDRIVE", glyphs = { "⚡", "✷", "↯" } },
+  { name = "UNSTOPPABLE", glyphs = { "⚡", "↯", "✷", "★" } },
 }
 
 local HL = { "PowerSurge1", "PowerSurge2", "PowerSurge3", "PowerSurge4", "PowerSurge5", "PowerSurge6" }
 
+-- Links, not colors: the effect follows any theme. The tiers climb from muted to loud.
 local LINKS = {
   PowerSurge1 = "Comment",
-  PowerSurge2 = "String",
-  PowerSurge3 = "Function",
+  PowerSurge2 = "Function",
+  PowerSurge3 = "DiagnosticInfo",
   PowerSurge4 = "DiagnosticWarn",
   PowerSurge5 = "DiagnosticError",
   PowerSurge6 = "Special",
   PowerSurgeFlash = "ErrorMsg",
 }
 
-local BOLD = { PowerSurge5 = true, PowerSurge6 = true }
+local BOLD = { PowerSurge4 = true, PowerSurge5 = true, PowerSurge6 = true }
 
 local state = {
   cfg = defaults,
   ns = nil,
   timer = nil,
+  decay = nil,
+  counter = nil, -- { buf, id } of the combo counter, while one is shown
   particles = {},
   combo = 0,
   level = 0,
@@ -122,6 +127,42 @@ local function drop(p)
   end
 end
 
+--- The combo counter: one extmark at the end of the cursor's line, rewritten in place.
+local function show_counter(win, buf, combo, level)
+  if not state.cfg.counter.enabled
+    or not vim.api.nvim_buf_is_valid(buf)
+    or vim.api.nvim_win_get_config(win).relative ~= ""
+  then
+    return
+  end
+  local name = tier(level).name
+  local text = ("⚡ %d"):format(combo)
+  if name ~= "" then
+    text = text .. "  " .. name
+  end
+  local row = unpack(vim.api.nvim_win_get_cursor(win))
+  local opts = {
+    virt_text = { { text, HL[math.min(#HL, level)] } },
+    virt_text_pos = "eol",
+    hl_mode = "combine",
+  }
+  if state.counter and state.counter.buf == buf then
+    opts.id = state.counter.id
+  end
+  local ok, id = pcall(vim.api.nvim_buf_set_extmark, buf, state.ns, row - 1, 0, opts)
+  if ok then
+    state.counter = { buf = buf, id = id }
+  end
+end
+
+local function hide_counter()
+  local c = state.counter
+  state.counter = nil
+  if c and vim.api.nvim_buf_is_valid(c.buf) then
+    pcall(vim.api.nvim_buf_del_extmark, c.buf, state.ns, c.id)
+  end
+end
+
 local function clear_particles()
   for _, p in ipairs(state.particles) do
     drop(p)
@@ -134,13 +175,18 @@ local function place(p, first)
   if not vim.api.nvim_buf_is_valid(p.buf) then
     return false
   end
-  local ok, id = pcall(vim.api.nvim_buf_set_extmark, p.buf, state.ns, math.max(0, math.floor(p.row)), math.max(0, math.floor(p.col)), {
-    id = first and nil or p.id,
+  local opts = {
     virt_text = { { p.glyph, p.hl } },
     virt_text_pos = "overlay",
     hl_mode = "combine",
-  })
+  }
+  -- A placed particle is moved by its own id; a new one gets an id from nvim.
+  if not first and p.id then
+    opts.id = p.id
+  end
+  local ok, id = pcall(vim.api.nvim_buf_set_extmark, p.buf, state.ns, math.max(0, math.floor(p.row)), math.max(0, math.floor(p.col)), opts)
   if not ok then
+    state.last_err = tostring(id)
     return false
   end
   p.id = id
@@ -161,9 +207,9 @@ local function spawn(buf, row, col, count, level)
     local p = {
       buf = buf,
       row = row,
-      col = math.max(0, col + (math.random() * 2 - 1) * 0.6),
+      col = math.max(0, col + (math.random() * 2 - 1) * cfg.spread * level),
       dx = (math.random() * 2 - 1) * cfg.kick * level,
-      dy = -0.6 - math.random() * 0.6 * level,
+      dy = -0.15 * math.random() * level,
       life = math.random(cfg.life[1], cfg.life[2]),
       glyph = t.glyphs[math.random(#t.glyphs)],
       hl = HL[math.min(#HL, level)],
@@ -191,7 +237,11 @@ local function step()
     p.row = p.row + p.dy
     p.col = p.col + p.dx
     local lines = vim.api.nvim_buf_is_valid(p.buf) and vim.api.nvim_buf_line_count(p.buf) or 0
-    if p.life > 0 and p.row >= 0 and p.row < lines and place(p, false) then
+    -- Clamp, never drop: a particle that leaves the buffer is invisible for good, which reads
+    -- as "nothing happened" near the top or bottom of a short file.
+    p.row = math.max(0, math.min(lines - 1, p.row))
+    p.col = math.max(0, p.col)
+    if p.life > 0 and place(p, false) then
       alive[#alive + 1] = p
     else
       drop(p)
@@ -202,8 +252,10 @@ local function step()
   if now() - state.last_ms > cfg.combo.decay_ms and state.level > 0 then
     state.combo = 0
     state.level = 0
+    hide_counter()
   end
-  if #state.particles == 0 then
+  -- The counter outlives the last particle: keep ticking until the combo decays.
+  if #state.particles == 0 and state.level == 0 then
     stop()
   end
 end
@@ -333,13 +385,14 @@ local function on_change()
   local row, col = unpack(vim.api.nvim_win_get_cursor(win))
   local count = math.random(cfg.burst[1], cfg.burst[2]) + (level - 1) * cfg.per_level
   spawn(buf, row - 1, col, count, level)
+  show_counter(win, buf, state.combo, level)
   start()
 
   if level > previous then
     if level >= cfg.shake.from_level then
       shake(win)
     end
-    local name = cfg.levels[level]
+    local name = tier(level).name
     if name then
       vim.notify(("⚡ %s ×%d"):format(name, state.combo), level >= 5 and vim.log.levels.WARN or vim.log.levels.INFO, {
         title = "power-surge",
@@ -370,6 +423,7 @@ function M.set_enabled(value)
     state.combo = 0
     state.level = 0
     clear_particles()
+    hide_counter()
     stop()
   end
   vim.notify("power-surge " .. (state.cfg.enabled and "on" or "off"), vim.log.levels.INFO, { title = "power-surge" })
@@ -383,6 +437,7 @@ end
 --- Live counters, for the statusline and for tests.
 function M.status()
   return {
+    error = state.last_err,
     combo = state.combo,
     level = state.level,
     particles = #state.particles,
@@ -393,6 +448,9 @@ end
 
 function M.clear()
   clear_particles()
+  hide_counter()
+  state.combo = 0
+  state.level = 0
   stop()
 end
 
