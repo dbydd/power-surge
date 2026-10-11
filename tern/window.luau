@@ -1,9 +1,9 @@
--- power-surge, Tern half: the easter egg gets a palette command, chords, and (when Tern
--- exposes it) the Files pane.
+-- power-surge, Tern half: sparks on every text change get a palette command, chords, and
+-- Tern's own Files pane as the file browser.
 --
 -- The particles live in Neovim (`power-surge`), because that is where text changes happen.
--- This half only drives it: every action types a `:lua` command into the focused Neovim
--- pane, so nothing else has to travel between the two.
+-- This half drives them: each action types a `:lua` command into the focused Neovim pane,
+-- so nothing else has to travel between the two.
 local function focused_nvim(cx)
   local focused = cx.session:focused()
   if focused == nil then
@@ -61,26 +61,19 @@ tern.command({
   end,
 })
 
+-- Tern's own Files pane is the file browser. `files` toggles it; the chord gives Neovim
+-- users the same muscle memory they have for <leader>e.
+tern.command({
+  id = "files",
+  title = "Toggle Files Pane",
+  icon = "folder",
+  group = "Power Surge",
+  keys = { "ctrl+alt+shift+f" },
+  run = function(cx)
+    cx:command("files")
+  end,
+})
+
 tern.bind("ctrl+alt+shift+e", function(cx)
   run_in_nvim(cx, "overdrive()")
 end)
-
--- Temporary: find out which built-in id toggles Tern's own Files pane.
-tern.command({
-  id = "probe",
-  title = "Power Surge: Probe File Ids",
-  icon = "zap",
-  group = "Power Surge",
-  run = function(cx)
-    for _, id in ipairs({ "files_toggle", "toggle_files", "show_files", "files", "files:toggle", "open_files", "files_pane" }) do
-      local ok, err = pcall(function()
-        cx:command(id)
-      end)
-      if ok then
-        cx:toast("success", "FOUND " .. id)
-        return
-      end
-      cx:toast("error", id, tostring(err))
-    end
-  end,
-})
