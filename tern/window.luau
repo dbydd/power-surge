@@ -1,18 +1,34 @@
 -- power-surge, Tern half.
 --
--- Two jobs:
+-- One job: while a combo is live in the Neovim pane, turn Tern's own cursor effects up, and
+-- put them back the way the user had them when the combo dies.
 --
--- 1. The combo counter lives in Tern's chrome, not behind the caret: the tab's title carries
---    `⚡ 12 SPARK`, and a glow sheet pulses the whole window as the combo climbs. Neovim
---    publishes the combo to one small JSON per working directory (`/tmp/power-surge/<sha>.json`);
---    this half reads the file for the tab it is titling, because pane content is not a window API.
--- 2. The controls: palette commands and chords that drive the Neovim half.
+-- The screen effect is Tern's, not ours: `cursor.trail` (what the cursor leaves when it moves)
+-- and `cursor.pulse` (what a shape change sets off). Nothing is drawn, styled or titled here —
+-- the combo only picks which of Tern's effects is playing, and at what volume.
 --
--- The file is the whole rendezvous. A fixed path both halves can open without agreeing on
--- $HOME, and the file says everything: Neovim writes it on every change, writes `level = 0`
--- when the combo decays, and writes once more as it exits. So a file that says `level > 0`
--- means a live Neovim with a live combo, and no shared clock is needed to believe it.
+-- Input comes from the Neovim half, which writes one small JSON per working directory
+-- (`/tmp/power-surge/<sha>.json`): the combo, its level, and when it was last touched. This
+-- half polls the file for the focused pane's directory and reacts to the level.
 local STATE_DIR = "/tmp/power-surge"
+
+--- What each combo level plays. Levels below the first row leave the user's own effects alone;
+--- the last row is the ceiling, so a longer combo keeps the loudest pair rather than racing off
+--- the end of either enum.
+local LADDER = {
+  [3] = { trail = "comet", pulse = "ripple" },
+  [4] = { trail = "blaze", pulse = "box_ripple" },
+  [5] = { trail = "sparks", pulse = "sonic_boom" },
+  [6] = { trail = "sparks", pulse = "box_boom" },
+}
+
+--- macOS resolves /tmp through /private/tmp, and a pane's cwd may carry either spelling.
+local function without_private(path)
+  if path:sub(1, 9) == "/private/" then
+    return path:sub(9)
+  end
+  return path
+end
 
 --- Tern shows the home directory as `~`, so compare a state file's absolute cwd in the same
 --- form the tab uses.
@@ -29,14 +45,6 @@ local function display(path, home)
     if tail:sub(1, 1) == "/" then
       return "~" .. tail
     end
-  end
-  return path
-end
-
---- macOS resolves /tmp through /private/tmp, and a pane's cwd may carry either spelling.
-local function without_private(path)
-  if path:sub(1, 9) == "/private/" then
-    return path:sub(9)
   end
   return path
 end
@@ -101,60 +109,6 @@ local function state_for(cwd)
   return nil
 end
 
--- A glow over the whole window, one rule per level: the higher the combo, the tighter and
--- brighter the ring. Rewritten only when the level changes.
-local GLOW = [[
-.tn-stage::after {
-  content: '';
-  position: absolute;
-  inset: 0;
-  pointer-events: none;
-  box-shadow: inset 0 0 %dpx %dpx var(--accent);
-  opacity: %.2f;
-}
-]]
-
-local applied_level = nil
-
-local function apply_glow(level)
-  if level == applied_level then
-    return
-  end
-  applied_level = level
-  if level <= 0 then
-    tern.css("power-surge", "")
-    return
-  end
-  tern.css("power-surge", string.format(GLOW, 12 * level, 3 * level, math.min(0.45, 0.08 * level)))
-end
-
---- The tab title: reads the state file for the tab's own directory, so no tab can see another
---- tab's combo, and answers nil the moment the file says the combo is over. Pure, because Tern
---- caches a formatter's answer against its input: nothing set here reaches the poll.
-tern.chrome.tab_title(function(tab)
-  local s = state_for(tab.cwd)
-  local level = s and tonumber(s.level) or 0
-  if level <= 0 then
-    return nil
-  end
-  local combo = tonumber(s.combo) or 0
-  local name = tostring(s.name or "")
-  local label = name ~= "" and name or "combo"
-  local out
-  if tab.name and tab.name ~= "" then
-    out = string.format("%s  ⚡%d", tab.name, combo)
-  else
-    out = string.format("%s  ⚡%d %s", tab.title, combo, label)
-  end
-  return out
-end)
-
--- Polling. A formatter's answer is cached per input, and the input (the tab) does not change
--- when the combo does, so a changed answer has to be followed by `chrome.refresh` on its own.
--- The cost is one small `read` per tick for the focused directory.
-local POLL_MS = 500
-local seen_level, seen_combo, seen_name = nil, nil, nil
-
 --- The focused tab's directory: it is the focused pane's cwd, and Tern reports it on the tab
 --- (a pane's own `cwd` is the shell's, which is what we want, but only the tab is guaranteed).
 local function focused_cwd(cx)
@@ -167,38 +121,116 @@ local function focused_cwd(cx)
   return nil
 end
 
---- Reads the focused directory's state and redraws the chrome when the answer moved.
-local function look(cx)
-  local s = state_for(focused_cwd(cx))
-  local level = s and tonumber(s.level) or 0
-  local combo = s and tonumber(s.combo) or 0
-  local name = s and tostring(s.name or "") or ""
-  if level == seen_level and combo == seen_combo and name == seen_name then
+-- The user's own effects, remembered in the plugin's key-value store: a crash mid-combo must
+-- not leave the terminal louder than the user left it.
+local BASE_KEY = "base_cursor"
+
+local function current_cursor(cx)
+  local ok, value = pcall(cx.settings.get, cx.settings, "cursor")
+  if not ok or type(value) ~= "table" then
+    return nil
+  end
+  return { trail = value.trail, pulse = value.pulse }
+end
+
+--- The user's baseline, from the store when it is there, else from the settings as they stand.
+--- A stored baseline that differs from the live settings is a boost left behind by a crash, so
+--- it wins and is put back.
+local function baseline(cx)
+  local live = current_cursor(cx)
+  if live == nil then
+    return nil
+  end
+  local stored = tern.kv.get(BASE_KEY)
+  if type(stored) == "table" and stored.trail and stored.pulse then
+    if stored.trail ~= live.trail or stored.pulse ~= live.pulse then
+      tern.log.warn("restoring cursor effects left boosted: " .. stored.trail .. "/" .. stored.pulse)
+      pcall(cx.settings.set, cx.settings, "cursor.trail", stored.trail)
+      pcall(cx.settings.set, cx.settings, "cursor.pulse", stored.pulse)
+    end
+    return { trail = stored.trail, pulse = stored.pulse }
+  end
+  tern.kv.set(BASE_KEY, live)
+  return live
+end
+
+local base = nil
+local applied = nil -- the pair currently in effect, so a change costs one write per step
+
+local function apply(cx, wanted)
+  if wanted == nil then
     return
   end
-  seen_level, seen_combo, seen_name = level, combo, name
-  apply_glow(level)
-  tern.chrome.refresh()
+  if applied and applied.trail == wanted.trail and applied.pulse == wanted.pulse then
+    return
+  end
+  applied = { trail = wanted.trail, pulse = wanted.pulse }
+  pcall(cx.settings.set, cx.settings, "cursor.trail", wanted.trail)
+  pcall(cx.settings.set, cx.settings, "cursor.pulse", wanted.pulse)
 end
+
+local function level_pair(level)
+  for i = math.min(level, 6), 3, -1 do
+    if LADDER[i] then
+      return LADDER[i]
+    end
+  end
+  return nil
+end
+
+--- Reads the focused directory's state and sets the effects for its level.
+--- The baseline is read once, from the first context that has settings; the timer's `cx` is
+--- the one that arrives first when the window is already up (a reload).
+local function ensure_base(cx)
+  if base == nil and cx and cx.settings then
+    base = baseline(cx)
+    applied = nil
+    apply(cx, base)
+  end
+end
+
+local function look(cx)
+  ensure_base(cx)
+  local s = state_for(focused_cwd(cx))
+  local level = s and tonumber(s.level) or 0
+  if level > 0 then
+    local pair = level_pair(level)
+    if pair == nil then
+      apply(cx, base)
+      return
+    end
+    apply(cx, { trail = pair.trail, pulse = pair.pulse })
+    return
+  end
+  apply(cx, base)
+end
+
+-- Polling: a state file is the only signal, so the effects come back to the user's own a beat
+-- after the last keystroke. One small `read` per tick.
+local POLL_MS = 400
 
 local function tick(cx)
   look(cx)
   tern.timer(POLL_MS, tick)
 end
 
-tern.on("focus", function()
-  tern.chrome.refresh()
+tern.on("window_start", function(cx)
+  ensure_base(cx)
+  tern.timer(POLL_MS, tick)
 end)
 
--- Armed when this module runs: on window start and again after a plugin reload, which is the
--- only way this half is restarted. A reload drops the old load's timers, so there is exactly
--- one chain, and it re-arms itself from here on.
+-- Armed when this module runs too: on a reload the window is already up, so `window_start` has
+-- come and gone, and this is what starts the poll again.
 tern.timer(POLL_MS, tick)
 
+--- `focus` carries the event first and its `cx` second, unlike `window_start`.
+tern.on("focus", function(_, cx)
+  look(cx)
+end)
 
---- Commands: the easter egg and the toggle, aimed at the focused pane.
+--- Commands: the easter egg and the toggle, aimed at the focused pane running Neovim.
 ---
---- `pane.program` reports the shell, never the editor running inside it, so a pane counts as
+--- `pane.program` reports the shell, never the editor inside it, so a pane counts as
 --- Neovim's when the Neovim half has published a state file for its directory.
 local function focused_nvim(cx)
   local focused = cx.session:focused()
@@ -233,9 +265,7 @@ tern.command({
     return focused_nvim(cx) ~= nil
   end,
   run = function(cx)
-    if run_in_nvim(cx, "overdrive()") then
-      cx:toast("info", "⚡ OVERDRIVE")
-    end
+    run_in_nvim(cx, "overdrive()")
   end,
 })
 
@@ -250,17 +280,6 @@ tern.command({
   end,
   run = function(cx)
     run_in_nvim(cx, "toggle()")
-  end,
-})
-
-tern.command({
-  id = "files",
-  title = "Toggle Files Pane",
-  icon = "folder",
-  group = "Power Surge",
-  keys = { "ctrl+alt+shift+f" },
-  run = function(cx)
-    cx:command("files")
   end,
 })
 
