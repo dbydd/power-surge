@@ -320,21 +320,11 @@ local function on_change()
   state.last_ms = t
 
   local level = level_of(state.combo)
-  local previous = state.level
   state.level = level
 
   show_counter()
   publish(false)
   arm_decay()
-
-  if level > previous then
-    local name = tier(level).name
-    if name then
-      vim.notify(("⚡ %s ×%d"):format(name, state.combo), level >= 5 and vim.log.levels.WARN or vim.log.levels.INFO, {
-        title = "power-surge",
-      })
-    end
-  end
 end
 
 local function on_typed(char)
