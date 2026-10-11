@@ -1,35 +1,56 @@
 # power-surge
 
-Sparks on every text change. A combo meter climbs while you type, the fountain gets
-sharper, and the screen shakes once the combo runs hot. Type `surge` in insert mode for
-the easter egg.
+Sparks on every text change in Neovim. A combo meter climbs while you type, the fountain
+gets sharper, and the screen shakes once the combo runs hot. The Tern half turns it into
+a command, a chord, and an easter egg.
+
+## The two halves
+
+| Path | What it is |
+|---|---|
+| `lua/power-surge.lua` | The Neovim plugin: particles, combo meter, easter egg |
+| `tern/` | The Tern plugin: palette commands, chords, and Tern-side controls |
+
+The particles live in Neovim, because that is where text changes happen. The Tern half
+drives them: each action types a `:lua` command into the focused Neovim pane.
+
+## Neovim
 
 ```lua
 {
-  "power-surge",
-  dir = "~/source/power-surge",
+  "dbydd/power-surge",
   event = "VeryLazy",
   opts = {},
 }
 ```
 
-## What it does
-
 | Where | Effect |
 |---|---|
-| Text change | 2 to 4 particles per change, more as the level climbs |
+| Text change | 2 to 4 particles, more as the level climbs |
 | Combo | 5 changes per level, up to level 6, reset after 1.2 s of quiet |
 | Level 3+ | sharper glyphs (`✳ ✷ ↯ ⚡`), wider fountain |
-| Level 4 to 6 | a toast, and the viewport shakes |
-| `surge` typed in insert | a 120-particle burst, a background flash, a shake |
+| Level 5, 6 | a toast, and the viewport shakes |
+| `surge` typed in insert mode | a 120-particle burst, a background flash, a shake |
+| `<leader>up` | toggle |
 
-## Commands
+```vim
+:PowerSurge on | off | toggle | overdrive
+```
 
-| Command | Effect |
-|---|---|
-| `:PowerSurge` | toggle |
-| `:PowerSurge on` / `off` | set the state |
-| `:PowerSurge overdrive` | fire the easter egg by hand |
+## Tern
+
+```sh
+tern plugin install github.com/dbydd/power-surge/tern
+```
+
+| Action | Chord | Effect |
+|---|---|---|
+| Power Surge: Overdrive | `ctrl+alt+shift+p` | the easter egg, in the focused Neovim pane |
+| Power Surge: Toggle | `ctrl+alt+shift+s` | turn the particles on or off |
+| Overdrive | `ctrl+alt+shift+e` | the bind, for muscle memory |
+
+Both commands show up in the palette, and both are available only while the focused pane
+runs `nvim` or `neotern`.
 
 ## Design notes
 
@@ -37,17 +58,16 @@ the easter egg.
   particle; `nvim_buf_del_extmark` retires it. There is no namespace clear and redraw.
 - **One timer, only while particles are alive.** The 45 fps loop stops itself when the
   last particle dies.
-- **Colors are links.** `PowerSurge1`–`6` link to standard highlight groups, so the
-  effect reads right in every theme; `ColorScheme` re-links them.
+- **Colors are links.** `PowerSurge1`–`6` link to standard highlight groups, so the effect
+  reads right in every theme; `ColorScheme` re-links them.
 - **Glyphs are text.** No image protocol, no font feature: it works in every UI, a Tern
-  surface included.
-- **The flash is window-local.** `winhighlight` gets a `PowerSurgeFlash` patch, then the
+  surface included, where each particle is one styled cell.
+- **The flash is window-local.** `winhighlight` gets a `PowerSurgeFlash` patch, and the
   window's own value comes back.
 
 ## Options
 
-Every default lives in `defaults` at the top of `lua/power-surge.lua`. The interesting
-ones:
+Every default lives in `defaults` at the top of `lua/power-surge.lua`:
 
 ```lua
 opts = {
