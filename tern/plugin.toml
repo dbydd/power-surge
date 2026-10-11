@@ -1,0 +1,7 @@
+schema = 1
+id = "power-surge"
+name = "Power Surge"
+version = "0.1.0"
+description = "Sparks on every text change in Neovim: a combo meter, an overdrive burst, and Tern controls for both."
+icon = "zap"
+window = "window.luau"
