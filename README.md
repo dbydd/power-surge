@@ -45,8 +45,6 @@ drives them: each action types a `:lua` command into the focused Neovim pane.
 tern plugin install github.com/dbydd/power-surge/tern
 ```
 
-The Neovim half is spawned by [neotern](https://github.com/arg3t/neotern) (installed here as
-`ntern`); the Tern half recognizes that pane by its state file.
 
 | Action | Chord | Effect |
 |---|---|---|
@@ -61,7 +59,7 @@ the level. It polls at 200 ms while a combo is live, 1 s while it fades, and sle
 minute of nothing until a window event wakes it.
 
 Both commands show up in the palette, and both are available only while the focused pane
-runs `nvim` or `ntern`.
+has a Neovim writing its state file (the pane whose `nvim` you last opened).
 
 ## Design notes
 

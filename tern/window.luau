@@ -2,17 +2,17 @@
 --
 -- Two jobs:
 --
--- 1. The combo counter lives in Tern's chrome, not behind the caret: the tab's title
---    carries `⚡ 12 SPARK`, and a glow sheet pulses the whole window as the combo climbs.
---    Neovim publishes the combo to one small JSON per working directory
---    (`~/.cache/power-surge/<sha>.json`); this half polls the file for the focused tab's
---    cwd, because pane content is not a window API.
+-- 1. The combo counter lives in Tern's chrome, not behind the caret: the tab's title carries
+--    `⚡ 12 SPARK`, and a glow sheet pulses the whole window as the combo climbs. Neovim
+--    publishes the combo to one small JSON per working directory (`/tmp/power-surge/<sha>.json`);
+--    this half reads the file for the tab it is titling, because pane content is not a window API.
 -- 2. The controls: palette commands and chords that drive the Neovim half.
--- A fixed path both halves can open: the Neovim half writes it, this half reads it.
+--
+-- The file is the whole rendezvous. A fixed path both halves can open without agreeing on
+-- $HOME, and the file says everything: Neovim writes it on every change, writes `level = 0`
+-- when the combo decays, and writes once more as it exits. So a file that says `level > 0`
+-- means a live Neovim with a live combo, and no shared clock is needed to believe it.
 local STATE_DIR = "/tmp/power-surge"
-local POLL_MS = 200
-
-local surge = { level = 0, combo = 0, name = "", at = 0 }
 
 --- Tern shows the home directory as `~`, so compare a state file's absolute cwd in the same
 --- form the tab uses.
@@ -33,8 +33,6 @@ local function display(path, home)
   return path
 end
 
---- A state file matches a tab when their directories agree, either as absolute paths or
---- after the `~` shortening Tern uses in some places.
 --- macOS resolves /tmp through /private/tmp, and a pane's cwd may carry either spelling.
 local function without_private(path)
   if path:sub(1, 9) == "/private/" then
@@ -43,8 +41,27 @@ local function without_private(path)
   return path
 end
 
-local function matches(file, tab_cwd)
-  if file == nil or tab_cwd == nil or tab_cwd == "" then
+--- Where there is no room, Tern abbreviates every directory but the last to its first letter:
+--- `/private/tmp` is shown as `/p/tmp`. A tab's cwd arrives either way, so both must match.
+local function abbrev(path)
+  local parts = {}
+  for part in string.gmatch(path, "[^/]+") do
+    parts[#parts + 1] = part
+  end
+  if #parts <= 1 then
+    return path
+  end
+  local out = {}
+  for i = 1, #parts - 1 do
+    out[i] = string.sub(parts[i], 1, 1)
+  end
+  out[#parts] = parts[#parts]
+  return "/" .. table.concat(out, "/")
+end
+
+--- Whether a state file belongs to `cwd`, in any of the spellings Tern may hand over.
+local function matches(file, cwd)
+  if file == nil or cwd == nil or cwd == "" then
     return false
   end
   local raw = file.cwd
@@ -52,19 +69,21 @@ local function matches(file, tab_cwd)
     return false
   end
   raw = raw:gsub("/+$", "")
-  local cwd = tab_cwd:gsub("/+$", "")
-  if raw == cwd then
-    return true
-  end
-  if without_private(raw) == without_private(cwd) then
+  cwd = cwd:gsub("/+$", "")
+  if raw == cwd or without_private(raw) == without_private(cwd) then
     return true
   end
   local shown = display(raw, file.home)
-  return shown == cwd or without_private(shown) == without_private(cwd)
+  for _, form in ipairs({ shown, abbrev(shown) }) do
+    if form == cwd or without_private(form) == without_private(cwd) then
+      return true
+    end
+  end
+  return false
 end
 
---- Read the state file for `cwd`; the file is the source of truth for the combo.
-local function read_state(cwd)
+--- The state file for `cwd`, decoded, or nil.
+local function state_for(cwd)
   if cwd == nil or cwd == "" or not tern.fs.exists(STATE_DIR) then
     return nil
   end
@@ -82,23 +101,6 @@ local function read_state(cwd)
   return nil
 end
 
---- The file is the whole truth: Neovim writes it on every change and writes `level = 0` when
---- the combo decays, so this half never has to guess staleness
---- (and the two processes do not share a clock).
-local function refresh_state(cwd)
-  local s = read_state(cwd)
-  if s then
-    surge = {
-      level = tonumber(s.level) or 0,
-      combo = tonumber(s.combo) or 0,
-      name = tostring(s.name or ""),
-      at = tonumber(s.at) or 0,
-    }
-  else
-    surge = { level = 0, combo = 0, name = "", at = 0 }
-  end
-end
-
 -- A glow over the whole window, one rule per level: the higher the combo, the tighter and
 -- brighter the ring. Rewritten only when the level changes.
 local GLOW = [[
@@ -112,9 +114,7 @@ local GLOW = [[
 }
 ]]
 
-local applied_level = -1
-local last_cwd = nil
-local last_cwd = nil
+local applied_level = nil
 
 local function apply_glow(level)
   if level == applied_level then
@@ -128,120 +128,85 @@ local function apply_glow(level)
   tern.css("power-surge", string.format(GLOW, 12 * level, 3 * level, math.min(0.45, 0.08 * level)))
 end
 
---- The tab title, refreshed by the poll below.
+--- The tab title: reads the state file for the tab's own directory, so no tab can see another
+--- tab's combo, and answers nil the moment the file says the combo is over. Pure, because Tern
+--- caches a formatter's answer against its input: nothing set here reaches the poll.
 tern.chrome.tab_title(function(tab)
-  last_cwd = tab.cwd
-  refresh_state(tab.cwd)
-  apply_glow(surge.level)
-  if surge.level <= 0 then
+  local s = state_for(tab.cwd)
+  local level = s and tonumber(s.level) or 0
+  if level <= 0 then
     return nil
   end
-  local label = surge.name ~= "" and surge.name or "combo"
+  local combo = tonumber(s.combo) or 0
+  local name = tostring(s.name or "")
+  local label = name ~= "" and name or "combo"
+  local out
   if tab.name and tab.name ~= "" then
-    return string.format("%s  ⚡%d", tab.name, surge.combo)
+    out = string.format("%s  ⚡%d", tab.name, combo)
+  else
+    out = string.format("%s  ⚡%d %s", tab.title, combo, label)
   end
-  return string.format("%s  ⚡%d %s", tab.title, surge.combo, label)
+  return out
 end)
 
--- Polling. It always runs, slowly when nothing is happening: a formatter's answer is cached
--- per input, so a title that changed must be followed by `refresh` on its own.
-local POLL_MS = 200 -- while a combo is live
-local IDLE_MS = 1000 -- while the last one is fading
-local SLEEP_TICKS = 60 -- ~a minute of nothing, then the loop stops until the next event
-local live = false
-local idle_ticks = 0
--- Upvalues the loop compares against; declared before it so the closure sees them.
-local combo_seen, level_seen, name_seen = -1, -1, nil
-local running = false
+-- Polling. A formatter's answer is cached per input, and the input (the tab) does not change
+-- when the combo does, so a changed answer has to be followed by `chrome.refresh` on its own.
+-- The cost is one small `read` per tick for the focused directory.
+local POLL_MS = 500
+local seen_level, seen_combo, seen_name = nil, nil, nil
 
-local function tick()
-  refresh_state(last_cwd)
-  local level = surge.level
-  local changed = (combo_seen ~= surge.combo) or (level_seen ~= level) or (name_seen ~= surge.name)
-  combo_seen, level_seen, name_seen = surge.combo, level, surge.name
-  apply_glow(level)
-  if changed then
-    tern.chrome.refresh()
-  end
-  live = level > 0
-  idle_ticks = live and 0 or (idle_ticks + 1)
-  if idle_ticks > SLEEP_TICKS then
-    running = false
-    return
-  end
-  running = true
-  tern.timer(live and POLL_MS or IDLE_MS, tick)
-end
-
---- Called when something may have started a combo: restarts the loop if it slept.
-local function wake()
-  if running then
-    return
-  end
-  running = true
-  idle_ticks = 0
-  tern.timer(60, tick)
-end
-
---- Commands: the easter egg and the toggle, aimed at the focused Neovim pane.
----
---- `pane.program` reports the shell that runs neotern, never neotern itself, so the pane is
---- recognized by its side of the bargain instead: a fresh state file for that pane's cwd
---- means the Neovim half is live there.
-local FRESH_MS = 15000
-
-local function has_state(cwd)
-  if cwd == nil or cwd == "" then
-    return false
-  end
-  if not tern.fs.exists(STATE_DIR) then
-    return false
-  end
-  for _, name in ipairs(tern.fs.list(STATE_DIR)) do
-    if string.sub(name, -5) == ".json" then
-      local ok, body = pcall(tern.fs.read, STATE_DIR .. "/" .. name, 4096)
-      if ok and body then
-        local decoded = tern.json.decode(body)
-        if decoded and matches(decoded, cwd) then
-          return decoded
-        end
-      end
+--- The focused tab's directory: it is the focused pane's cwd, and Tern reports it on the tab
+--- (a pane's own `cwd` is the shell's, which is what we want, but only the tab is guaranteed).
+local function focused_cwd(cx)
+  local focus = cx.session:focused()
+  for _, tab in ipairs(cx.session:tabs()) do
+    if tab.pane == focus and tab.cwd and tab.cwd ~= "" then
+      return tab.cwd
     end
   end
   return nil
 end
 
---- True only while the pane's Neovim half is alive: the file must be recent, and two polls
---- apart the combo changes, so an old file from a closed editor does not qualify.
-local function nvim_pane(cwd, title)
-  if title and (string.match(title, "ntern") or string.match(title, "neotern") or string.match(title, "nvim")) then
-    return cwd
+--- Reads the focused directory's state and redraws the chrome when the answer moved.
+local function look(cx)
+  local s = state_for(focused_cwd(cx))
+  local level = s and tonumber(s.level) or 0
+  local combo = s and tonumber(s.combo) or 0
+  local name = s and tostring(s.name or "") or ""
+  if level == seen_level and combo == seen_combo and name == seen_name then
+    return
   end
-  local decoded = has_state(cwd)
-  if decoded == nil then
-    return nil
-  end
-  local seen = (state_seen[cwd] or 0)
-  if decoded.combo ~= seen then
-    state_seen[cwd] = decoded.combo
-    fresh_seen[cwd] = tern.now()
-    return cwd
-  end
-  if (tern.now() - (fresh_seen[cwd] or 0)) < FRESH_MS then
-    return cwd
-  end
-  return nil
+  seen_level, seen_combo, seen_name = level, combo, name
+  apply_glow(level)
+  tern.chrome.refresh()
 end
 
-local state_seen, fresh_seen = {}, {}
+local function tick(cx)
+  look(cx)
+  tern.timer(POLL_MS, tick)
+end
 
+tern.on("focus", function()
+  tern.chrome.refresh()
+end)
+
+-- Armed when this module runs: on window start and again after a plugin reload, which is the
+-- only way this half is restarted. A reload drops the old load's timers, so there is exactly
+-- one chain, and it re-arms itself from here on.
+tern.timer(POLL_MS, tick)
+
+
+--- Commands: the easter egg and the toggle, aimed at the focused pane.
+---
+--- `pane.program` reports the shell, never the editor running inside it, so a pane counts as
+--- Neovim's when the Neovim half has published a state file for its directory.
 local function focused_nvim(cx)
   local focused = cx.session:focused()
   if focused == nil then
     return nil
   end
   for _, pane in ipairs(cx.session:panes()) do
-    if pane.pane == focused and nvim_pane(pane.cwd, pane.title) then
+    if pane.pane == focused and state_for(pane.cwd) then
       return pane.pane
     end
   end
@@ -251,7 +216,7 @@ end
 local function run_in_nvim(cx, lua)
   local pane = focused_nvim(cx)
   if pane == nil then
-    cx:toast("info", "Power Surge rides in a Neovim pane", "Open neotern, then try again")
+    cx:toast("info", "Power Surge rides in Neovim", "Open a file with nvim, then try again")
     return false
   end
   cx:run(pane, ':lua require("power-surge").' .. lua .. "\r")
@@ -270,7 +235,6 @@ tern.command({
   run = function(cx)
     if run_in_nvim(cx, "overdrive()") then
       cx:toast("info", "⚡ OVERDRIVE")
-      wake()
     end
   end,
 })
@@ -286,7 +250,6 @@ tern.command({
   end,
   run = function(cx)
     run_in_nvim(cx, "toggle()")
-    wake()
   end,
 })
 
@@ -302,7 +265,5 @@ tern.command({
 })
 
 tern.bind("ctrl+alt+shift+e", function(cx)
-  if run_in_nvim(cx, "overdrive()") then
-    wake()
-  end
+  run_in_nvim(cx, "overdrive()")
 end)

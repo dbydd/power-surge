@@ -52,7 +52,6 @@ local defaults = {
   },
 }
 
--- One row per combo level: sharper glyphs and a wider fountain as the combo climbs.
 --- One row per combo level: sharper glyphs and a wider fountain as the combo climbs.
 local TIERS = {
   { name = "", glyphs = { "•", "∙" } },
@@ -168,13 +167,20 @@ local function publish(force)
   local payload = vim.json.encode({
     cwd = vim.fn.getcwd(),
     home = vim.env.HOME, -- Tern shows the home directory as `~`; it needs the prefix to match
-    home = vim.env.HOME, -- Tern shows the home directory as `~`; it needs the prefix to match
     combo = state.combo,
     level = state.level,
     name = tier(state.level).name,
     at = t,
   })
   pcall(vim.fn.writefile, { payload }, path)
+end
+
+--- The last word, so a closed editor cannot leave a live combo on screen: the file is the
+--- Tern half's only signal, and it outlives the process that wrote it.
+local function publish_dead()
+  state.combo = 0
+  state.level = 0
+  publish(true)
 end
 
 local function clear_particles()
@@ -490,6 +496,7 @@ function M.setup(opts)
       end,
     })
     vim.api.nvim_create_autocmd("ColorScheme", { group = group, callback = define_hl })
+    vim.api.nvim_create_autocmd("VimLeavePre", { group = group, callback = publish_dead })
     vim.api.nvim_create_autocmd("BufWipeout", {
       group = group,
       callback = function(args)
