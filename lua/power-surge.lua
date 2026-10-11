@@ -175,6 +175,11 @@ local function place(p, first)
   if not vim.api.nvim_buf_is_valid(p.buf) then
     return false
   end
+  -- `overlay` needs a cell inside the line: a col past the end of a short line raises
+  -- "Invalid 'col': out of range" and the particle never appears.
+  local row = math.max(0, math.min(vim.api.nvim_buf_line_count(p.buf) - 1, math.floor(p.row)))
+  local line = vim.api.nvim_buf_get_lines(p.buf, row, row + 1, false)[1] or ""
+  local col = math.max(0, math.min(#line, math.floor(p.col)))
   local opts = {
     virt_text = { { p.glyph, p.hl } },
     virt_text_pos = "overlay",
@@ -184,7 +189,7 @@ local function place(p, first)
   if not first and p.id then
     opts.id = p.id
   end
-  local ok, id = pcall(vim.api.nvim_buf_set_extmark, p.buf, state.ns, math.max(0, math.floor(p.row)), math.max(0, math.floor(p.col)), opts)
+  local ok, id = pcall(vim.api.nvim_buf_set_extmark, p.buf, state.ns, row, col, opts)
   if not ok then
     state.last_err = tostring(id)
     return false
